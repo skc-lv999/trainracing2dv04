@@ -230,25 +230,19 @@ app.post("/api/matchmaking/join", (req, res) => {
     }
   });
 
-  // Search for an open room waiting for players on the SAME line
-  let targetRoom = Object.values(rooms).find(
-    (r) => r.status === "waiting" && r.line === requestedLine && Object.keys(r.players).length < 2
-  );
-
-  let isNew = false;
-  if (!targetRoom) {
-    const roomId = "room_" + Math.random().toString(36).substring(2, 9);
-    targetRoom = {
-      id: roomId,
-      status: "waiting",
-      players: {},
-      trackFeatures: generateTrackFeatures(requestedLine),
-      trackLength: trackLength,
-      line: requestedLine,
-    };
-    rooms[roomId] = targetRoom;
-    isNew = true;
-  }
+  // For Solo Time Attack flow: always create a new private room that starts countdown immediately!
+  const roomId = "room_" + Math.random().toString(36).substring(2, 9);
+  const targetRoom: GameRoom = {
+    id: roomId,
+    status: "countdown",
+    startTime: Date.now() + 4000,
+    countdownSec: 4,
+    players: {},
+    trackFeatures: generateTrackFeatures(requestedLine),
+    trackLength: trackLength,
+    line: requestedLine,
+  };
+  rooms[roomId] = targetRoom;
 
   const initialPlayerStats: PlayerStats = {
     id: playerId,
@@ -263,13 +257,6 @@ app.post("/api/matchmaking/join", (req, res) => {
   };
 
   targetRoom.players[playerId] = initialPlayerStats;
-
-  // If we now have 2 players, start the countdown!
-  if (Object.keys(targetRoom.players).length === 2) {
-    targetRoom.status = "countdown";
-    targetRoom.startTime = Date.now() + 4000; // start racing in 4 seconds
-    targetRoom.countdownSec = 4;
-  }
 
   res.json({
     playerId,

@@ -3,7 +3,7 @@ import { TrainVisual } from "./components/TrainVisual.js";
 import { MasconController } from "./components/MasconController.js";
 import { MasconState, PlayerStats, GameRoom, TrackFeature, LeaderboardEntry } from "./types.js";
 import { motion, AnimatePresence } from "motion/react";
-import { Trophy, Compass, ShieldAlert, Zap, Flame, Award, Train, Users, ShieldAlert as AlertIcon, RotateCcw, Volume2, VolumeX, Landmark } from "lucide-react";
+import { Trophy, Compass, ShieldAlert, Zap, Award, Train, Users, ShieldAlert as AlertIcon, RotateCcw, Volume2, VolumeX, Landmark } from "lucide-react";
 
 // Support multiple lines configurations
 export const getLineConfig = (lineName: 'yamanote' | 'chuo' | 'shonan') => {
@@ -15,7 +15,8 @@ export const getLineConfig = (lineName: 'yamanote' | 'chuo' | 'shonan') => {
       stationEnd: 730,
       signal1: 1300,
       signal2: 1700,
-      stationLabel: "恵比寿駅"
+      stationLabel: "恵比寿駅",
+      quotaTime: 110, // Stage quota Time (110s)
     };
   } else if (lineName === 'chuo') {
     return {
@@ -25,7 +26,8 @@ export const getLineConfig = (lineName: 'yamanote' | 'chuo' | 'shonan') => {
       stationEnd: 1030,
       signal1: 1600,
       signal2: 2200,
-      stationLabel: "三鷹駅"
+      stationLabel: "三鷹駅",
+      quotaTime: 125, // Stage quota Time (125s)
     };
   } else {
     // shonan
@@ -36,7 +38,8 @@ export const getLineConfig = (lineName: 'yamanote' | 'chuo' | 'shonan') => {
       stationEnd: 860,
       signal1: 1700,
       signal2: 2300,
-      stationLabel: "湘南大磯駅"
+      stationLabel: "湘南大磯駅",
+      quotaTime: 115, // Stage quota Time (115s)
     };
   }
 };
@@ -184,15 +187,51 @@ export default function App() {
           e.preventDefault();
           setIsLobbyStarted(true);
           playSynthSound("chime");
-          setTimeout(() => {
-            setActiveModal('game_start');
-          }, 100);
         }
       }
     };
     window.addEventListener("keydown", handleGlobalKey);
     return () => window.removeEventListener("keydown", handleGlobalKey);
   }, [activeScreen, isLobbyStarted]);
+
+  // Global keyboard listener for active train racing gameplay (W/S & Arrow keys & Space)
+  useEffect(() => {
+    if (activeScreen !== "racing") return;
+
+    const handleRacingKey = (e: KeyboardEvent) => {
+      const activeElement = document.activeElement;
+      if (activeElement && (activeElement.tagName === "INPUT" || activeElement.tagName === "TEXTAREA")) {
+        return;
+      }
+
+      const NOTCH_LIST: MasconState[] = ["P4", "P3", "P2", "P1", "N", "B1", "B2", "B3", "EB"];
+      const currentNotch = myMasconRef.current;
+      const currentIndex = NOTCH_LIST.indexOf(currentNotch);
+
+      if (e.key === "w" || e.key === "W" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (currentIndex > 0) {
+          const nextNotch = NOTCH_LIST[currentIndex - 1];
+          myMasconRef.current = nextNotch;
+          playSynthSound("beep");
+        }
+      } else if (e.key === "s" || e.key === "S" || e.key === "ArrowDown") {
+        e.preventDefault();
+        if (currentIndex < NOTCH_LIST.length - 1) {
+          const nextNotch = NOTCH_LIST[currentIndex + 1];
+          myMasconRef.current = nextNotch;
+          playSynthSound("beep");
+        }
+      } else if (e.key === " ") {
+        e.preventDefault();
+        myMasconRef.current = "EB";
+        playSynthSound("beep");
+      }
+    };
+
+    window.addEventListener("keydown", handleRacingKey);
+    return () => window.removeEventListener("keydown", handleRacingKey);
+  }, [activeScreen]);
 
   // Network Multi-player states
   const [playerId, setPlayerId] = useState<string | null>(null);
@@ -275,12 +314,14 @@ export default function App() {
     myDerailTimeLeft: 0,
     myFinished: false,
     myFinishTime: undefined as number | undefined,
+    myMascon: "N" as MasconState,
     opponentPosition: 0,
     opponentSpeed: 0,
     opponentFinished: false,
     opponentDerailed: false,
     opponentName: "対戦相手 (Driver 2)",
     opponentMascon: "N" as MasconState,
+    atcLimit: 110,
   });
 
   // Station stop challenges specific state
@@ -294,6 +335,23 @@ export default function App() {
   // Warnings displayed in HUD
   const [atcWarning, setAtcWarning] = useState("");
   const [derailRisk, setDerailRisk] = useState(0); // 0 to 100
+
+  // Solo time attack & speed limit penalty states
+  const [speedPenaltyTimeLeft, setSpeedPenaltyTimeLeft] = useState(0);
+  const [mySpeedViolationsCount, setMySpeedViolationsCount] = useState(0);
+
+  // Pausable intermediate station stops tracking
+  const pausedTimeMsRef = useRef<number>(0);
+  const [stationPausedAccumMs, setStationPausedAccumMs] = useState(0);
+
+  // Speed penalty tracking refs
+  const speedPenaltyTimeLeftRef = useRef<number>(0);
+  const mySpeedViolationsCountRef = useRef<number>(0);
+  const boardingTimeLeftRef = useRef<number>(0);
+  const speedBoostActiveRef = useRef<boolean>(false);
+  const myStationCompletedRef = useRef<boolean>(false);
+  const activeLineRef = useRef<"yamanote" | "chuo" | "shonan">("shonan");
+  const currentFeaturesRef = useRef<TrackFeature[]>([]);
 
   // Standard Local Refs for ultra-precise, high-frequency physical 60fps simulation loops
   const myPositionRef = useRef(0);
@@ -327,6 +385,7 @@ export default function App() {
   const cpuDerailTimeLeftRef = useRef(0);
   const cpuFinishedRef = useRef(false);
   const cpuStationTimerRef = useRef(0); // boarding at station stop
+  const cpuStationCompletedRef = useRef<boolean>(false);
 
   // Load Leaderboards on mount
   useEffect(() => {
@@ -368,6 +427,17 @@ export default function App() {
     cpuDerailTimeLeftRef.current = 0;
     cpuFinishedRef.current = false;
     cpuStationTimerRef.current = 0;
+    cpuStationCompletedRef.current = false;
+
+    pausedTimeMsRef.current = 0;
+    setStationPausedAccumMs(0);
+    myStationCompletedRef.current = false;
+    speedPenaltyTimeLeftRef.current = 0;
+    setSpeedPenaltyTimeLeft(0);
+    mySpeedViolationsCountRef.current = 0;
+    setMySpeedViolationsCount(0);
+    boardingTimeLeftRef.current = 0;
+    speedBoostActiveRef.current = false;
 
     setStationStopped(false);
     setStationGrade("");
@@ -387,6 +457,7 @@ export default function App() {
     }
     resetLocalPhysics();
     setIsCpuMatch(cpuOnly);
+    activeLineRef.current = selectedLine;
 
     // Initial audio context initiation to prevent browser blocking
     try {
@@ -460,7 +531,7 @@ export default function App() {
           clearInterval(lobbyPollIdRef.current);
           setActiveScreen("racing");
           raceStartTimeRef.current = data.startTime;
-          startPhysicsSimulation();
+          startPhysicsSimulation(data);
           startStateSynchronization(rId, pId);
         }
       } catch (e) {
@@ -531,6 +602,7 @@ export default function App() {
 
             setRenderStats((prev) => ({
               ...prev,
+              myMascon: myMasconRef.current,
               opponentPosition: opp.position,
               opponentSpeed: opp.speed,
               opponentFinished: opp.finished,
@@ -611,29 +683,9 @@ export default function App() {
       return;
     }
 
-    // Handles Station Stops
-    if (cpuPositionRef.current >= cfg.stationStart && cpuPositionRef.current <= cfg.stationEnd && cpuStationTimerRef.current === 0) {
-      // slow down to stop at stationStop
-      const distToStop = cfg.stationStop - cpuPositionRef.current;
-      if (distToStop > 5) {
-        cpuMasconRef.current = "B2";
-        // smooth deceleration
-        if (cpuSpeedRef.current < distToStop * 1.5) {
-          cpuMasconRef.current = "N";
-        }
-      } else {
-        cpuMasconRef.current = "EB";
-        if (cpuSpeedRef.current === 0) {
-          // stopped completely! start boarding timer
-          cpuStationTimerRef.current = 3.0; // 3 seconds boarding
-          playSynthSound("chime");
-        }
-      }
-    }
-
-    // Tick down boarding timer at station
+    // 1. Tick down boarding timer at station
     if (cpuStationTimerRef.current > 0) {
-      cpuStationTimerRef.current -= dt;
+      cpuStationTimerRef.current = Math.max(0, cpuStationTimerRef.current - dt);
       cpuMasconRef.current = "N";
       cpuSpeedRef.current = 0;
       if (cpuStationTimerRef.current <= 0) {
@@ -645,8 +697,8 @@ export default function App() {
       return;
     }
 
-    // General driving logic (accelerating vs curve speed limits vs red lights)
-    let targetSpeed = activeLine === 'yamanote' ? 85 : activeLine === 'chuo' ? 115 : 110; 
+    // 2. Calculate general cruising target speed
+    let targetSpeed = activeLine === 'yamanote' ? 85 : activeLine === 'chuo' ? 115 : 110;
 
     // Calculate signals state from room start time
     const elapsedSec = raceStartTimeRef.current ? (Date.now() - raceStartTimeRef.current) / 1000 : 0;
@@ -655,23 +707,27 @@ export default function App() {
     const firstSignalRed = elapsedSec < 12;
     const secondSignalRed = elapsedSec < 24;
 
-    if (cpuPositionRef.current < cfg.signal1 && cpuPositionRef.current > cfg.signal1 - 200 && firstSignalRed) {
+    if (cpuPositionRef.current < cfg.signal1 && cpuPositionRef.current > cfg.signal1 - 250 && firstSignalRed) {
       // Decelerate early for Signal 1 Red light
       const dist = cfg.signal1 - cpuPositionRef.current;
-      targetSpeed = Math.min(targetSpeed, dist * 0.4);
+      targetSpeed = Math.min(targetSpeed, Math.max(0, dist * 0.45));
     }
-    if (cpuPositionRef.current < cfg.signal2 && cpuPositionRef.current > cfg.signal2 - 200 && secondSignalRed) {
+    if (cpuPositionRef.current < cfg.signal2 && cpuPositionRef.current > cfg.signal2 - 250 && secondSignalRed) {
       // Decelerate early for Signal 2 Red light
       const dist = cfg.signal2 - cpuPositionRef.current;
-      targetSpeed = Math.min(targetSpeed, dist * 0.4);
+      targetSpeed = Math.min(targetSpeed, Math.max(0, dist * 0.45));
     }
 
-    // Check speed limit zones curves
+    // Check speed limit zones curves (anticipatory deceleration 180m ahead)
     trackFeatures.forEach((f) => {
       if (f.type === "speed_limit") {
         // approaching limit zone, brake early!
-        if (cpuPositionRef.current < f.position && cpuPositionRef.current > f.position - 150) {
-          targetSpeed = Math.min(targetSpeed, f.value);
+        if (cpuPositionRef.current < f.position && cpuPositionRef.current > f.position - 180) {
+          const distToLimit = f.position - cpuPositionRef.current;
+          // Interpolate target speed down to the limit
+          const ratio = distToLimit / 180;
+          const approachTarget = f.value + (targetSpeed - f.value) * ratio;
+          targetSpeed = Math.min(targetSpeed, approachTarget);
         }
         // inside limit zone
         if (cpuPositionRef.current >= f.position && cpuPositionRef.current <= f.position + f.length) {
@@ -680,19 +736,54 @@ export default function App() {
       }
     });
 
-    // Translate target speed into physical Mascon selection
-    if (cpuSpeedRef.current < targetSpeed - 10) {
-      // Accelerate safely
-      if (cpuOverheatRef.current > 85) {
-        cpuMasconRef.current = "P1"; // drop notch to cool down
+    // 3. Handles Station Stop smooth pattern deceleration
+    const distToStop = cfg.stationStop - cpuPositionRef.current;
+    if (!cpuStationCompletedRef.current && distToStop < 220 && distToStop > -3) {
+      // Custom multi-stage smooth decelerator
+      let stationTargetSpeed = 0;
+      if (distToStop > 120) {
+        stationTargetSpeed = 75;
+      } else if (distToStop > 60) {
+        stationTargetSpeed = 45;
+      } else if (distToStop > 25) {
+        stationTargetSpeed = 25;
+      } else if (distToStop > 8) {
+        stationTargetSpeed = 10;
+      } else if (distToStop > 1) {
+        stationTargetSpeed = 3;
       } else {
-        cpuMasconRef.current = "P4";
+        stationTargetSpeed = 0;
       }
-    } else if (cpuSpeedRef.current < targetSpeed - 1) {
+
+      targetSpeed = Math.min(targetSpeed, stationTargetSpeed);
+
+      // Stopped within acceptable accuracy zone (-1m to +2m)
+      if (distToStop <= 1.5 && distToStop >= -1 && cpuSpeedRef.current < 0.5) {
+        cpuSpeedRef.current = 0;
+        cpuMasconRef.current = "N";
+        cpuStationTimerRef.current = 3.5; // boarding starts
+        cpuStationCompletedRef.current = true;
+        playSynthSound("chime");
+        animateCpuPhysics(dt, 0);
+        return;
+      }
+    }
+
+    // 4. Translate target speed into physical Mascon selection
+    const speedDiff = targetSpeed - cpuSpeedRef.current;
+    if (speedDiff > 8) {
+      cpuMasconRef.current = "P4";
+    } else if (speedDiff > 3) {
       cpuMasconRef.current = "P2";
-    } else if (cpuSpeedRef.current > targetSpeed + 10) {
+    } else if (speedDiff > 0.5) {
+      cpuMasconRef.current = "P1";
+    } else if (speedDiff < -12) {
+      cpuMasconRef.current = "EB";
+    } else if (speedDiff < -5) {
       cpuMasconRef.current = "B3";
-    } else if (cpuSpeedRef.current > targetSpeed + 2) {
+    } else if (speedDiff < -2) {
+      cpuMasconRef.current = "B2";
+    } else if (speedDiff < -0.5) {
       cpuMasconRef.current = "B1";
     } else {
       cpuMasconRef.current = "N"; // coast
@@ -703,17 +794,7 @@ export default function App() {
   };
 
   const animateCpuPhysics = (dt: number, limitSpeed: number) => {
-    // Overheat simulation
-    if (cpuMasconRef.current === "P4") {
-      cpuOverheatRef.current += dt * 8;
-    } else {
-      cpuOverheatRef.current = Math.max(0, cpuOverheatRef.current - dt * 6);
-    }
-
-    if (cpuOverheatRef.current >= 100) {
-      cpuOverheatRef.current = 100;
-      cpuMasconRef.current = "N"; // force blown circuit
-    }
+    cpuOverheatRef.current = 0;
 
     // Calculate applied acceleration
     let a = 0;
@@ -721,7 +802,7 @@ export default function App() {
       a = -12.0; // severe force deceleration
     } else {
       const m = cpuMasconRef.current;
-      if (m === "P4" && cpuOverheatRef.current < 100) a = 2.8;
+      if (m === "P4") a = 2.8;
       else if (m === "P3") a = 2.0;
       else if (m === "P2") a = 1.1;
       else if (m === "P1") a = 0.5;
@@ -752,8 +833,13 @@ export default function App() {
   };
 
   // --- CORE GAME LOOP (RUNS 60FPS AT VELOCITY SCALE) ---
-  const startPhysicsSimulation = () => {
+  const startPhysicsSimulation = (r?: GameRoom) => {
     if (animationFrameIdRef.current) cancelAnimationFrame(animationFrameIdRef.current);
+
+    const activeRoom = r || room;
+    if (activeRoom) {
+      currentFeaturesRef.current = activeRoom.trackFeatures || [];
+    }
 
     let lastTime = performance.now();
 
@@ -768,14 +854,15 @@ export default function App() {
       if (raceStartTimeRef.current && now >= raceStartTimeRef.current) {
         
         // 1. UPDATE CPU IF CPU OPPONENT ACTIVE
-        const features = room?.trackFeatures || [];
+        const features = currentFeaturesRef.current;
         updateCpuDriverSim(dt, features);
 
         // 2. TIMERS & BUFFS
-        if (speedBoostActive) {
+        if (speedBoostActiveRef.current) {
           setBoostTimer((prev) => {
             if (prev - dt <= 0) {
               setSpeedBoostActive(false);
+              speedBoostActiveRef.current = false;
               return 0;
             }
             return prev - dt;
@@ -785,24 +872,39 @@ export default function App() {
         let positionGain = 0;
 
         // Inside Station Stop Boarding period
-        if (boardingTimeLeft > 0) {
-          setBoardingTimeLeft((prev) => {
-            const left = prev - dt;
-            if (left <= 0) {
-              setStationStopped(false);
-              setStationGrade("");
-              // push slightly past station block so it doesn't trigger stop immediately again
-              const activeLine_ = room?.line || 'shonan';
-              const cfg_ = getLineConfig(activeLine_);
-              myPositionRef.current = cfg_.stationStop + 1;
-              playSynthSound("beep");
-              return 0;
-            }
-            return left;
-          });
+        if (boardingTimeLeftRef.current > 0) {
+          // Accumulate paused timer inside station
+          pausedTimeMsRef.current += dt * 1000;
+          setStationPausedAccumMs(pausedTimeMsRef.current);
+
+          boardingTimeLeftRef.current = Math.max(0, boardingTimeLeftRef.current - dt);
+          setBoardingTimeLeft(boardingTimeLeftRef.current);
+          if (boardingTimeLeftRef.current <= 0) {
+            setStationStopped(false);
+            setStationGrade("");
+            myStationCompletedRef.current = true;
+            // push slightly past station block so it doesn't trigger stop immediately again
+            const activeLine_ = activeLineRef.current;
+            const cfg_ = getLineConfig(activeLine_);
+            myPositionRef.current = cfg_.stationStop + 1;
+            playSynthSound("beep");
+          }
           // Stop physics updates during passenger exchange
           mySpeedRef.current = 0;
           myMasconRef.current = "N";
+        } else if (speedPenaltyTimeLeftRef.current > 0) {
+          // Exceeded speed limit penalty is active: stop train, lock controls
+          const prevPenalty = speedPenaltyTimeLeftRef.current;
+          speedPenaltyTimeLeftRef.current = Math.max(0, speedPenaltyTimeLeftRef.current - dt);
+          setSpeedPenaltyTimeLeft(speedPenaltyTimeLeftRef.current);
+          mySpeedRef.current = 0;
+          myMasconRef.current = "EB";
+          positionGain = 0;
+
+          // If penalty just finished, auto-reset notch to Neutral so they aren't trapped in EB!
+          if (speedPenaltyTimeLeftRef.current <= 0 && prevPenalty > 0) {
+            myMasconRef.current = "N";
+          }
         } else {
           // 3. APPLY PLAYER VEHICLE PHYSICS
           let accelForce = 0;
@@ -815,48 +917,30 @@ export default function App() {
               myDerailTimeLeftRef.current = 0;
             }
           } else {
-            // Overheat circuit-breaker block
-            if (myOverheatRef.current >= 100) {
-              accelForce = 0;
-              myOverheatRef.current -= dt * 14; 
-              if (myOverheatRef.current <= 25) {
-                // fuse reset once cooled down below 25
-                myOverheatRef.current = 25;
-              }
-            } else {
-              // Active acceleration power based on current mascon handle selection
-              const notch = myMasconRef.current;
-              // Apply acceleration multiplier if perfect stop speed boost is active
-              const boostMultiplier = speedBoostActive ? 1.6 : 1.0;
+            myOverheatRef.current = 0;
+            // Active acceleration power based on current mascon handle selection
+            const notch = myMasconRef.current;
+            // Apply acceleration multiplier if perfect stop speed boost is active
+            const boostMultiplier = speedBoostActiveRef.current ? 1.6 : 1.0;
 
-              if (notch === "P4") {
-                accelForce = 2.8 * boostMultiplier;
-                myOverheatRef.current += dt * 13; // temperature increases
-              } else if (notch === "P3") {
-                accelForce = 2.0 * boostMultiplier;
-                myOverheatRef.current += dt * 5.5;
-              } else if (notch === "P2") {
-                accelForce = 1.1 * boostMultiplier;
-                myOverheatRef.current += dt * 1.5;
-              } else if (notch === "P1") {
-                accelForce = 0.5 * boostMultiplier;
-                myOverheatRef.current = Math.max(0, myOverheatRef.current - dt * 1.5);
-              } else if (notch === "N") {
-                accelForce = 0.0;
-                myOverheatRef.current = Math.max(0, myOverheatRef.current - dt * 6.5);
-              } else if (notch === "B1") {
-                accelForce = -1.6;
-                myOverheatRef.current = Math.max(0, myOverheatRef.current - dt * 8);
-              } else if (notch === "B2") {
-                accelForce = -3.5;
-                myOverheatRef.current = Math.max(0, myOverheatRef.current - dt * 8);
-              } else if (notch === "B3") {
-                accelForce = -5.8;
-                myOverheatRef.current = Math.max(0, myOverheatRef.current - dt * 8);
-              } else if (notch === "EB") {
-                accelForce = -9.2;
-                myOverheatRef.current = Math.max(0, myOverheatRef.current - dt * 8);
-              }
+            if (notch === "P4") {
+              accelForce = 2.8 * boostMultiplier;
+            } else if (notch === "P3") {
+              accelForce = 2.0 * boostMultiplier;
+            } else if (notch === "P2") {
+              accelForce = 1.1 * boostMultiplier;
+            } else if (notch === "P1") {
+              accelForce = 0.5 * boostMultiplier;
+            } else if (notch === "N") {
+              accelForce = 0.0;
+            } else if (notch === "B1") {
+              accelForce = -1.6;
+            } else if (notch === "B2") {
+              accelForce = -3.5;
+            } else if (notch === "B3") {
+              accelForce = -5.8;
+            } else if (notch === "EB") {
+              accelForce = -9.2;
             }
           }
 
@@ -877,30 +961,48 @@ export default function App() {
         let warningText = "";
         let riskValue = 0;
 
-        const activeLine = room?.line || 'shonan';
+        const activeLine = activeLineRef.current;
         const cfg = getLineConfig(activeLine);
 
-        // Check active curves & speed limits
+        // Check active curves & speed limits with elegant 200m advance notification notice!
+        let speedLimitWarning = "";
+        let approachingWarning = "";
+
         features.forEach((feat) => {
           if (feat.type === "speed_limit") {
             const insideLimit = myPositionRef.current >= feat.position && myPositionRef.current <= feat.position + feat.length;
             if (insideLimit) {
               currentAtcLimit = feat.value;
               if (mySpeedRef.current > feat.value) {
-                warningText = `⚠️ 速度超過！ 制限速度 ${feat.value}km/h`;
-                // Scale derail risk between go-over limit speed boundaries (+0km/h is 0 risk, +20km/h is 100 risk)
-                riskValue = Math.min(100, Math.max(0, ((mySpeedRef.current - feat.value) / 18) * 100));
-
-                // Derailment triggers if exceeding limit safety limit for more than 1.4 seconds continuously
-                if (riskValue >= 90) {
-                  if (Math.random() < 0.03) { // 3% random derailment risk ticks at dangerous curve speeds
-                    triggerDerailment();
-                  }
+                speedLimitWarning = `⚠️ 速度超過！ 制限速度 ${feat.value}km/h`;
+                if (speedPenaltyTimeLeftRef.current <= 0) {
+                  // Trigger 5-second speed limit violation penalty!
+                  speedPenaltyTimeLeftRef.current = 5.0;
+                  setSpeedPenaltyTimeLeft(5.0);
+                  mySpeedViolationsCountRef.current += 1;
+                  setMySpeedViolationsCount(mySpeedViolationsCountRef.current);
+                  mySpeedRef.current = 0; // stop train immediately
+                  playSynthSound("buzzer");
+                }
+              }
+            } else {
+              // Approaching limit early warning check within 200m
+              const distToLimit = feat.position - myPositionRef.current;
+              if (distToLimit > 0 && distToLimit <= 200) {
+                const text = `📢 予告：前方 ${Math.round(distToLimit)}m 先に制限 ${feat.value}km/h (${feat.label || "速度制限"})`;
+                if (!approachingWarning) {
+                  approachingWarning = text;
                 }
               }
             }
           }
         });
+
+        if (speedLimitWarning) {
+          warningText = speedLimitWarning;
+        } else if (approachingWarning) {
+          warningText = approachingWarning;
+        }
 
         // Dynamic Signal colors calculations based on elapsed milliseconds
         const sig1Red = elapsedSec < 12;
@@ -928,7 +1030,7 @@ export default function App() {
         }
 
         // 5. JAPANESE STATION STOP CHALLENGE
-        if (myPositionRef.current >= cfg.stationStart && myPositionRef.current <= cfg.stationEnd && !stationStopped) {
+        if (myPositionRef.current >= cfg.stationStart && myPositionRef.current <= cfg.stationEnd && !stationStopped && !myStationCompletedRef.current) {
           const deltaStopM = cfg.stationStop - myPositionRef.current;
           
           if (mySpeedRef.current === 0) {
@@ -940,13 +1042,15 @@ export default function App() {
         }
 
         // Overrun check if passenger completely rolls past station end without stopping
-        if (myPositionRef.current > cfg.stationEnd && myPositionRef.current < cfg.stationEnd + 40 && !stationStopped && myPositionRef.current - positionGain <= cfg.stationEnd) {
+        if (myPositionRef.current > cfg.stationEnd && myPositionRef.current < cfg.stationEnd + 40 && !stationStopped && !myStationCompletedRef.current && myPositionRef.current - positionGain <= cfg.stationEnd) {
           setStationStopped(true);
+          myStationCompletedRef.current = true;
           setStationGrade("🚨 オーバーラン！ 🚨");
           setStationMsg("停車位置を大幅に超過しました。乗客苦情のため 5.0秒間加速・出力ペナルティ！");
           setAtcWarning("ペナルティ！出力制限中");
           myOverheatRef.current = 80;
           setBoardingTimeLeft(5.0);
+          boardingTimeLeftRef.current = 5.0;
           playSynthSound("buzzer");
         }
 
@@ -955,9 +1059,14 @@ export default function App() {
           myPositionRef.current = cfg.trackLength;
           mySpeedRef.current = 0;
           myFinishedRef.current = true;
-          const finalTimeMs = raceStartTimeRef.current ? (Date.now() - raceStartTimeRef.current) : 0;
+          const finalTimeMs = raceStartTimeRef.current ? (Date.now() - raceStartTimeRef.current - pausedTimeMsRef.current) : 0;
           myFinishTimeRef.current = finalTimeMs;
           playSynthSound("chime");
+        }
+
+        // Overwrite warning if speed penalty is active:
+        if (speedPenaltyTimeLeftRef.current > 0) {
+          warningText = `🚫 速度超過制限！5秒緊急停止中 (${speedPenaltyTimeLeftRef.current.toFixed(1)}s)`;
         }
 
         // Render warnings inside status bar HUD
@@ -973,12 +1082,14 @@ export default function App() {
           myDerailTimeLeft: myDerailTimeLeftRef.current,
           myFinished: myFinishedRef.current,
           myFinishTime: myFinishTimeRef.current,
+          myMascon: myMasconRef.current,
           opponentPosition: opponentPositionRef.current,
           opponentSpeed: opponentSpeedRef.current,
           opponentFinished: opponentFinishedRef.current,
           opponentDerailed: opponentDerailedRef.current,
           opponentName: renderStats.opponentName,
           opponentMascon: opponentMasconRef.current,
+          atcLimit: currentAtcLimit,
         });
       }
 
@@ -1016,19 +1127,23 @@ export default function App() {
       setStationMsg("完璧な位置に停車しました！ モーター排熱完了＆加速ブースト15秒間獲得！");
       myOverheatRef.current = 0; // reset heat
       setSpeedBoostActive(true);
+      speedBoostActiveRef.current = true;
       setBoostTimer(15.0); // 15s speed buff!
       setBoardingTimeLeft(3.0); // standard boarding wait
+      boardingTimeLeftRef.current = 3.0;
       playSynthSound("chime");
       playSynthSound("boost");
     } else if (accuracy <= 4.0) {
       setStationGrade("👍 停車グッド！ 👍");
       setStationMsg("良好な位置です。安全に乗客扱中（待ち時間3.5秒）");
       setBoardingTimeLeft(3.5);
+      boardingTimeLeftRef.current = 3.5;
       playSynthSound("chime");
     } else {
       setStationGrade("⚠️ 停車バッド (ズレ大) ⚠️ ");
       setStationMsg("位置がずれています。乗降に時間がかかります。（待ち時間5.0秒）");
       setBoardingTimeLeft(5.0);
+      boardingTimeLeftRef.current = 5.0;
       playSynthSound("buzzer");
     }
   };
@@ -1056,7 +1171,7 @@ export default function App() {
   // Render elapsed running time
   const getElapsedTimeStr = () => {
     if (!raceStartTimeRef.current) return "00:00.00";
-    const delta = Date.now() - raceStartTimeRef.current;
+    const delta = Date.now() - raceStartTimeRef.current - pausedTimeMsRef.current;
     if (delta < 0) return "00:00.00";
     const m = Math.floor(delta / 60000);
     const s = Math.floor((delta % 60000) / 1000);
@@ -1077,7 +1192,7 @@ export default function App() {
       {/* 16:9 Aspect Ratio Arcade Console Frame Container */}
       <div 
         id="widescreen-frame"
-        className="w-full max-w-[1440px] aspect-video bg-slate-900 border-2 sm:border-4 border-slate-800 rounded-xl sm:rounded-3xl shadow-[0_30px_70px_-15px_rgba(0,0,0,0.95)] overflow-hidden flex flex-col relative shrink-0"
+        className="w-full max-w-[1440px] aspect-video bg-slate-900 border-2 sm:border-4 border-slate-800 rounded-xl sm:rounded-3xl shadow-[0_30px_70px_-15px_rgba(0,0,0,0.95)] overflow-y-auto md:overflow-hidden flex flex-col relative shrink-0"
         style={{
           width: 'min(100%, calc((100vh - 24px) * 16 / 9))',
           aspectRatio: '16/9',
@@ -1130,9 +1245,6 @@ export default function App() {
             if (!isLobbyStarted) {
               setIsLobbyStarted(true);
               playSynthSound("chime");
-              setTimeout(() => {
-                setActiveModal('game_start');
-              }, 100);
             }
           }}
           className={`flex-1 relative overflow-hidden flex flex-col justify-between p-6 md:p-12 transition-all duration-700 ${!isLobbyStarted ? 'cursor-pointer' : ''}`}
@@ -1183,15 +1295,12 @@ export default function App() {
                     e.stopPropagation();
                     setIsLobbyStarted(true);
                     playSynthSound("chime");
-                    setTimeout(() => {
-                      setActiveModal('game_start');
-                    }, 100);
                   }}
                   className="group relative h-16 w-80 sm:w-96 bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500 border-2 border-yellow-350 text-slate-950 font-sans font-extrabold text-2xl rounded-2xl shadow-[0_12px_40px_rgba(234,179,8,0.5)] flex items-center justify-center gap-4 cursor-pointer transform -skew-x-6 transition-all duration-200 hover:scale-105 hover:brightness-110 active:scale-95 shadow-yellow-500/25 z-20"
                 >
                   <div className="transform skew-x-6 flex items-center gap-3">
                     <span className="text-3xl animate-bounce">🎮</span>
-                    <span className="tracking-widest text-slate-950 font-black">ゲームスタート / START</span>
+                    <span className="tracking-widest text-slate-950 font-black">システム起動 / ENTER SYSTEM</span>
                   </div>
                 </button>
                 
@@ -1380,7 +1489,7 @@ export default function App() {
                       <div className="space-y-6">
                         <div className="space-y-2 text-center">
                           <p className="text-sm text-slate-300 font-sans leading-relaxed">
-                            全ダイヤを管理する運行システムに対戦運転士名をエントリーしてください。
+                            乗務に先立ち、運転指令室に運転士の登録名を入力してください。
                           </p>
                         </div>
 
@@ -1424,25 +1533,11 @@ export default function App() {
                                 return;
                               }
                               setActiveModal('none');
-                              handleJoinQueue(false);
+                              handleJoinQueue(true); // Always play solo with CPU
                             }}
-                            className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-sans font-black text-lg py-4.5 px-8 rounded-2xl shadow-lg cursor-pointer transform transition-all active:scale-98 flex items-center justify-center gap-2"
+                            className="w-full bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500 text-slate-950 font-sans font-black text-lg py-4.5 px-8 rounded-2xl shadow-lg cursor-pointer transform transition-all active:scale-98 flex items-center justify-center gap-2 hover:scale-101 border-2 border-yellow-350 shadow-yellow-500/10"
                           >
-                            <span>⚔️</span> オンライン全国対戦 運転開始
-                          </button>
-
-                          <button
-                            onClick={() => {
-                              if (!nickname.trim()) {
-                                alert("運転士のニックネームを入力してください。");
-                                return;
-                              }
-                              setActiveModal('none');
-                              handleJoinQueue(true);
-                            }}
-                            className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-sans font-black text-base py-4 px-8 rounded-2xl cursor-pointer transition-all flex items-center justify-center gap-2"
-                          >
-                            <span>🤖</span> 練習用のAIと対戦 (すぐ開始)
+                            <span>🚄</span> 乗務開始 (タイムアタック・対戦スタート)
                           </button>
                         </div>
                       </div>
@@ -1472,8 +1567,9 @@ export default function App() {
                                 お馴染み緑とオレンジの湘南色E231系。長い直線区間と大磯駅の正確な制動停止が特徴。
                               </span>
                             </div>
-                            <div className="text-right font-mono font-black mt-4 md:mt-0 px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-amber-400 text-sm shrink-0">
-                              2700メートル
+                            <div className="text-right font-mono font-black mt-4 md:mt-0 px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-amber-400 text-sm shrink-0 flex flex-col items-end gap-1">
+                              <span>2700メートル</span>
+                              <span className="text-emerald-400 text-xs font-bold font-sans">⏱️ 地形ノルマ: 115.0秒</span>
                             </div>
                           </button>
 
@@ -1493,8 +1589,9 @@ export default function App() {
                                 次世代ウグイス色のE235系。駅間距離が最も短く、こまめな加減速と細やかなブレーキ制御が重要。
                               </span>
                             </div>
-                            <div className="text-right font-mono font-black mt-4 md:mt-0 px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-amber-400 text-sm shrink-0">
-                              2100メートル
+                            <div className="text-right font-mono font-black mt-4 md:mt-0 px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-amber-400 text-sm shrink-0 flex flex-col items-end gap-1">
+                              <span>2100メートル</span>
+                              <span className="text-lime-400 text-xs font-bold font-sans">⏱️ 地形ノルマ: 110.0秒</span>
                             </div>
                           </button>
 
@@ -1514,8 +1611,9 @@ export default function App() {
                                 力強いオレンジデコレーションE233系。最高出力が高く、高速直線を一気に駆け抜ける長距離ダッシュ！
                               </span>
                             </div>
-                            <div className="text-right font-mono font-black mt-4 md:mt-0 px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-amber-400 text-sm shrink-0">
-                              2800メートル
+                            <div className="text-right font-mono font-black mt-4 md:mt-0 px-4 py-2 bg-slate-950 border border-slate-800 rounded-lg text-amber-400 text-sm shrink-0 flex flex-col items-end gap-1">
+                              <span>2800メートル</span>
+                              <span className="text-red-400 text-xs font-bold font-sans">⏱️ 地形ノルマ: 125.0秒</span>
                             </div>
                           </button>
                         </div>
@@ -1824,7 +1922,7 @@ export default function App() {
 
       {/* --- SCREEN 3: ACTIVE GAMEBOARD RACING --- */}
       {activeScreen === "racing" && room && (
-        <main className="flex-1 flex flex-col p-3 sm:p-4 gap-3 md:gap-4 relative select-none overflow-hidden justify-between h-full">
+        <main className="flex-1 flex flex-col p-3 sm:p-4 gap-3 md:gap-4 relative select-none overflow-y-auto justify-between h-full">
           
           {/* TRACK HUD BAR PANEL */}
           {(() => {
@@ -1904,6 +2002,13 @@ export default function App() {
                     <div className="text-[10px] font-mono text-slate-500">ELAPSED TIME</div>
                     <div className="text-2xl font-mono font-bold text-slate-200 tracking-wider">
                       {getElapsedTimeStr()}
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-right">
+                    <div className="text-[9px] font-mono text-emerald-400">STAGE QUOTA 目標</div>
+                    <div className="text-sm font-mono font-bold text-emerald-300">
+                      {getLineConfig(room.line || "shonan").quotaTime}.00秒
                     </div>
                   </div>
 
@@ -2055,7 +2160,7 @@ export default function App() {
                     <div className="absolute transition-all duration-300" style={{ left: `${opponentX}px`, width: '420px', height: '91px', bottom: '0px' }}>
                       <TrainVisual 
                         speed={renderStats.opponentSpeed} 
-                        isBraking={renderStats.opponentMascon.startsWith("B") || renderStats.opponentMascon === "EB"}
+                        isBraking={(renderStats.opponentMascon || "N").startsWith("B") || renderStats.opponentMascon === "EB"}
                         isPlayer={false}
                         isAI={isCpuMatch}
                         derailed={renderStats.opponentDerailed}
@@ -2081,21 +2186,154 @@ export default function App() {
               </div>
             )}
 
-            {/* Overheating blown-break lock overlay */}
-            {renderStats.myOverheat >= 100 && (
-              <div className="absolute inset-x-0 top-0 bg-rose-950/80 border-b border-rose-600/50 py-2 text-center text-xs font-mono font-bold text-rose-350 z-20 animate-pulse flex items-center justify-center gap-2">
-                <Flame className="w-4 h-4 text-rose-400 animate-bounce" />
-                🚨 過熱防止保護ヒューズ溶断：出力遮断中！ 自動冷却をお待ちください。 🚨
-              </div>
-            )}
-
             {/* Station stopped boarding indicator timer */}
             {boardingTimeLeft > 0 && (
-              <div className="absolute inset-0 bg-slate-950/70 flex flex-col items-center justify-center font-mono z-20">
-                <span className="text-xs text-emerald-400 font-bold">{stationGrade}</span>
-                <span className="text-[10.5px] text-slate-300 max-w-sm mt-1">{stationMsg}</span>
-                <div className="mt-4 flex items-center gap-2 bg-emerald-950 border border-emerald-800 px-4 py-1.5 rounded-full text-emerald-300 animate-pulse font-bold text-sm">
-                  乗客乗降中 ドア閉まで：{boardingTimeLeft.toFixed(1)}s
+              <div className="absolute inset-0 bg-slate-950/85 flex flex-col items-center justify-center font-mono z-20 p-4">
+                <div className="w-full max-w-lg bg-slate-900 border-2 border-emerald-500/30 rounded-2xl p-6 shadow-[0_0_50px_rgba(16,185,129,0.15)] flex flex-col items-center space-y-4">
+                  
+                  {/* Station JR-East style Signboard */}
+                  <div className="w-full bg-white text-slate-900 border-t-8 border-emerald-600 rounded-lg p-2.5 shadow-md flex flex-col items-center select-none">
+                    <div className="text-[10px] text-slate-400 tracking-wider font-sans font-bold">PLATFORM 1 / 1番線ホーム</div>
+                    <div className="text-xl font-extrabold font-sans tracking-tight flex items-center gap-2 text-slate-800">
+                      <span>🚉</span> {getLineConfig(activeLineRef.current).stationLabel}
+                    </div>
+                    <div className="text-[9px] text-slate-500 font-sans tracking-widest font-semibold mt-0.5 uppercase">
+                      {activeLineRef.current === 'yamanote' ? 'EBISU STATION (Ebisu)' : activeLineRef.current === 'chuo' ? 'MITAKA STATION (Mitaka)' : 'SHONAN-OISO STATION (Oiso)'}
+                    </div>
+                  </div>
+
+                  {/* Animated Door and Passenger Scene Panel */}
+                  <div className="w-full h-44 bg-slate-950 border border-slate-800 rounded-xl relative overflow-hidden flex flex-col justify-end p-2">
+                    {/* Sky/Platform background */}
+                    <div className="absolute inset-x-0 top-0 h-1/2 bg-slate-900/60 flex items-center justify-between px-6 border-b border-slate-800/40">
+                      <div className="text-[9px] text-slate-500 font-bold">● 乗車口 4号車</div>
+                      <div className="text-[9px] text-slate-500 font-bold">LED案内板: 先発 各駅停車</div>
+                    </div>
+
+                    {/* Emojis of Passengers walking on platform */}
+                    <div className="absolute inset-x-0 bottom-4 h-12 pointer-events-none z-10 flex items-center justify-center overflow-hidden">
+                      {/* Left-to-right boarding passengers */}
+                      <motion.div 
+                        initial={{ x: -180, opacity: 0 }}
+                        animate={{ x: [ -180, -20, 0 ], opacity: [ 0, 1, 0 ] }}
+                        transition={{ duration: 2.8, repeat: Infinity, ease: "linear" }}
+                        className="absolute text-xl"
+                      >
+                        🏃‍♂️
+                      </motion.div>
+                      <motion.div 
+                        initial={{ x: -140, opacity: 0 }}
+                        animate={{ x: [ -140, -10, 0 ], opacity: [ 0, 1, 0 ] }}
+                        transition={{ duration: 2.4, delay: 0.5, repeat: Infinity, ease: "linear" }}
+                        className="absolute text-xl"
+                      >
+                        👨‍💼
+                      </motion.div>
+                      <motion.div 
+                        initial={{ x: -200, opacity: 0 }}
+                        animate={{ x: [ -200, -30, 0 ], opacity: [ 0, 1, 0 ] }}
+                        transition={{ duration: 3.2, delay: 1.0, repeat: Infinity, ease: "linear" }}
+                        className="absolute text-xl"
+                      >
+                        👩‍💼
+                      </motion.div>
+
+                      {/* Right-to-left boarding passengers */}
+                      <motion.div 
+                        initial={{ x: 180, opacity: 0 }}
+                        animate={{ x: [ 180, 20, 0 ], opacity: [ 0, 1, 0 ] }}
+                        transition={{ duration: 2.6, repeat: Infinity, ease: "linear" }}
+                        className="absolute text-xl"
+                      >
+                        🏃‍♀️
+                      </motion.div>
+                      <motion.div 
+                        initial={{ x: 130, opacity: 0 }}
+                        animate={{ x: [ 130, 10, 0 ], opacity: [ 0, 1, 0 ] }}
+                        transition={{ duration: 2.3, delay: 0.6, repeat: Infinity, ease: "linear" }}
+                        className="absolute text-xl"
+                      >
+                        🚶‍♂️
+                      </motion.div>
+                      <motion.div 
+                        initial={{ x: 210, opacity: 0 }}
+                        animate={{ x: [ 210, 30, 0 ], opacity: [ 0, 1, 0 ] }}
+                        transition={{ duration: 3.0, delay: 1.2, repeat: Infinity, ease: "linear" }}
+                        className="absolute text-xl"
+                      >
+                        👩‍⚕️
+                      </motion.div>
+                    </div>
+
+                    {/* Train Wall and Sliding Doors */}
+                    <div className="absolute inset-x-0 bottom-0 h-20 bg-slate-800 border-t border-slate-700 z-20 flex justify-center overflow-hidden">
+                      {/* Train line accent color bar */}
+                      <div className={`absolute top-2 inset-x-0 h-3 flex ${
+                        activeLineRef.current === 'yamanote' 
+                          ? 'bg-emerald-500' 
+                          : activeLineRef.current === 'chuo' 
+                            ? 'bg-orange-500' 
+                            : 'bg-gradient-to-r from-orange-500 to-green-600'
+                      }`} />
+
+                      {/* Sliding Doors Container */}
+                      <div className="relative w-28 h-full bg-slate-900 border-x border-slate-700 flex">
+                        {/* Inside Door Area */}
+                        <div className="absolute inset-0 bg-slate-950 flex items-center justify-center">
+                          <span className="text-sm">🚃</span>
+                        </div>
+
+                        {/* Left Door Leaf */}
+                        <motion.div 
+                          animate={{ 
+                            x: boardingTimeLeft > 0.6 ? -45 : 0 
+                          }}
+                          transition={{ duration: 0.5, ease: "easeInOut" }}
+                          className="absolute left-0 w-1/2 h-full bg-slate-600 border-r border-slate-500 shadow-inner flex items-center justify-end pr-1"
+                        >
+                          <div className="w-1 h-12 bg-yellow-400 rounded-sm" />
+                        </motion.div>
+
+                        {/* Right Door Leaf */}
+                        <motion.div 
+                          animate={{ 
+                            x: boardingTimeLeft > 0.6 ? 45 : 0 
+                          }}
+                          transition={{ duration: 0.5, ease: "easeInOut" }}
+                          className="absolute right-0 w-1/2 h-full bg-slate-600 border-l border-slate-500 shadow-inner flex items-center justify-start pl-1"
+                        >
+                          <div className="w-1 h-12 bg-yellow-400 rounded-sm" />
+                        </motion.div>
+                      </div>
+                    </div>
+
+                    {/* Platform floor */}
+                    <div className="w-full h-4 bg-slate-700 border-t-2 border-yellow-400 z-30" />
+                  </div>
+
+                  {/* Grading and Messages */}
+                  <div className="text-center space-y-1">
+                    <span className="text-sm text-emerald-400 font-bold block">{stationGrade}</span>
+                    <span className="text-[11px] text-slate-300 block max-w-sm">{stationMsg}</span>
+                  </div>
+
+                  {/* Countdown Timer with Door Indicator */}
+                  <div className="w-full space-y-1.5">
+                    <div className="flex justify-between items-center text-[11px] font-bold">
+                      <span className="text-slate-400">🚪 {boardingTimeLeft > 0.6 ? "乗客乗降中 (ドア開放)" : "まもなくドアが閉まります"}</span>
+                      <span className="text-emerald-400 animate-pulse">{boardingTimeLeft.toFixed(1)}s</span>
+                    </div>
+                    {/* Animated Progress Bar */}
+                    <div className="w-full bg-slate-950 h-2.5 rounded-full border border-slate-800 overflow-hidden">
+                      <motion.div 
+                        initial={{ width: "100%" }}
+                        animate={{ width: `${(boardingTimeLeft / 5.0) * 100}%` }}
+                        transition={{ duration: 0.1, ease: "linear" }}
+                        className="bg-gradient-to-r from-emerald-500 to-teal-400 h-full"
+                      />
+                    </div>
+                  </div>
+
                 </div>
               </div>
             )}
@@ -2138,12 +2376,12 @@ export default function App() {
               currentNotch={renderStats.myMascon}
               setNotch={handleSetNotch}
               speed={renderStats.mySpeed}
-              overheat={renderStats.myOverheat}
               acceleration={
                 renderStats.myDerailed 
                   ? 0 
                   : (renderStats.myMascon === "P4" ? 2.8 : renderStats.myMascon === "P3" ? 2.0 : renderStats.myMascon === "P2" ? 1.1 : renderStats.myMascon === "P1" ? 0.5 : renderStats.myMascon === "N" ? 0 : renderStats.myMascon === "B1" ? -1.6 : renderStats.myMascon === "B2" ? -3.5 : renderStats.myMascon === "B3" ? -5.8 : -9.2)
               }
+              atcLimit={renderStats.atcLimit}
             />
           </section>
         </main>
@@ -2166,58 +2404,84 @@ export default function App() {
               </p>
             </div>
 
-            {/* Race Summary Statistics and Winner declaration */}
-            <div className="space-y-4 bg-slate-950 border border-slate-800/80 rounded-xl p-5 text-left font-mono">
-              <div className="flex justify-between items-center pb-2 border-b border-slate-800/60">
-                <span className="text-xs text-slate-500">🏆 WINNER 運転士名</span>
-                <span className="text-sm font-bold text-amber-400 flex items-center gap-1">
-                  {room.winnerId === playerId ? nickname : (room.players[room.winnerId || ""]?.name || "対戦相手")}
-                </span>
-              </div>
+            {/* Race Summary Statistics and Solo Time Attack evaluations */}
+            {(() => {
+              const cfg = getLineConfig(room.line || "shonan");
+              const isCleared = renderStats.myFinishTime && (renderStats.myFinishTime <= cfg.quotaTime * 1000);
+              
+              return (
+                <div className="space-y-4 bg-slate-950 border border-slate-800/80 rounded-xl p-5 text-left font-mono">
+                  
+                  {/* Status Banner */}
+                  <div className="text-center py-3 rounded-lg border flex flex-col justify-center items-center gap-1 bg-slate-900 border-slate-800">
+                    <span className="text-[10px] text-slate-500 uppercase tracking-widest">クリア目標判定</span>
+                    {isCleared ? (
+                      <span className="text-xl font-bold font-sans text-emerald-400 animate-pulse flex items-center gap-1">
+                        🏆 ノルマ達成 (STAGE CLEAR!)
+                      </span>
+                    ) : (
+                      <span className="text-xl font-bold font-sans text-rose-500 animate-pulse flex items-center gap-1">
+                        🚨 ノルマ未達成 (STAGE FAILED)
+                      </span>
+                    )}
+                  </div>
 
-              <div className="space-y-2 pt-2">
-                <h4 className="text-[10px] text-slate-500 uppercase tracking-widest">レース記録詳細</h4>
-                
-                {/* Your stats */}
-                <div className="flex justify-between text-xs items-center">
-                  <span className="text-slate-300 flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-indigo-500" /> {nickname} (あなた)
-                  </span>
-                  <span className="font-bold text-emerald-400">
-                    {renderStats.myFinishTime ? getLeaderboardTimeStr(renderStats.myFinishTime) : "リタイア / 記録なし"}
-                  </span>
-                </div>
+                  <div className="space-y-2.5 pt-2 text-xs">
+                    <h4 className="text-[10px] text-slate-500 uppercase tracking-widest border-b border-slate-850 pb-1">走行リザルト明細</h4>
+                    
+                    {/* Selected Line */}
+                    <div className="flex justify-between items-center py-0.5">
+                      <span className="text-slate-400">乗務路線：</span>
+                      <span className="font-bold text-slate-200">
+                        {room.line === "yamanote" ? "山手線ダイヤ" : room.line === "chuo" ? "中央快速線ダイヤ" : "湘南新宿ラインダイヤ"}
+                      </span>
+                    </div>
 
-                {/* Opponent's stats */}
-                {(() => {
-                  const oppKey = Object.keys(room.players).find((id) => id !== playerId);
-                  if (oppKey) {
-                    const opp = room.players[oppKey];
-                    return (
-                      <div className="flex justify-between text-xs items-center">
-                        <span className="text-slate-300 flex items-center gap-1.5">
-                          <span className="w-2 h-2 rounded bg-amber-500" /> {opp.name}
-                        </span>
-                        <span className="font-bold text-slate-400">
-                          {opp.finishTime ? getLeaderboardTimeStr(opp.finishTime) : "リタイア / 記録なし"}
-                        </span>
-                      </div>
-                    );
-                  }
-                  return null;
-                })()}
-              </div>
+                    {/* Final Finish Time */}
+                    <div className="flex justify-between items-center py-0.5 border-t border-slate-900/50">
+                      <span className="text-slate-400">運転タイム (補正後)：</span>
+                      <span className={`font-black text-sm ${isCleared ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {renderStats.myFinishTime ? getLeaderboardTimeStr(renderStats.myFinishTime) : "記録なし"}
+                      </span>
+                    </div>
 
-              {room.winnerId === playerId ? (
-                <div className="mt-4 p-3 bg-indigo-950/30 border border-indigo-900/60 rounded-lg text-[10.5px] text-indigo-300 text-center leading-relaxed">
-                  🎉 おめでとうございます！他線のライバルを僅差で抑え、名誉ある安全神速レコードを獲得しました！
+                    {/* Stage Quota Goal */}
+                    <div className="flex justify-between items-center py-0.5 border-t border-slate-900/50">
+                      <span className="text-slate-400">ノルマ設定：</span>
+                      <span className="font-bold text-slate-200">
+                        {cfg.quotaTime}.00 秒以内
+                      </span>
+                    </div>
+
+                    {/* Violations Count */}
+                    <div className="flex justify-between items-center py-0.5 border-t border-slate-900/50">
+                      <span className="text-slate-400">速度制限超過ペナルティ：</span>
+                      <span className={`font-bold ${mySpeedViolationsCount > 0 ? 'text-rose-400' : 'text-slate-400'}`}>
+                        {mySpeedViolationsCount} 回 ({mySpeedViolationsCount * 5} 秒間強制停止)
+                      </span>
+                    </div>
+
+                    {/* Station Stopped Paused Accrued Time */}
+                    <div className="flex justify-between items-center py-0.5 border-t border-slate-900/50">
+                      <span className="text-slate-400">途中駅客扱タイマー停止補正：</span>
+                      <span className="font-bold text-amber-400">
+                        -{(stationPausedAccumMs / 1000).toFixed(2)} 秒
+                      </span>
+                    </div>
+                  </div>
+
+                  {isCleared ? (
+                    <div className="mt-4 p-3 bg-emerald-950/30 border border-emerald-900/60 rounded-lg text-[10.5px] text-emerald-300 text-center leading-relaxed">
+                      🎉 おめでとうございます！過酷な速度超過ペナルティと駅制動を乗り越え、制限ノルマをクリアしました！
+                    </div>
+                  ) : (
+                    <div className="mt-4 p-3 bg-rose-950/20 border border-rose-900/50 rounded-lg text-[10.5px] text-rose-350 text-center leading-relaxed">
+                      🏁 タイムアップ！速度制限を遵守し、途中駅でのエクセレント停車（15秒ブースト）を有効活用してタイム短縮を狙いましょう！
+                    </div>
+                  )}
                 </div>
-              ) : (
-                <div className="mt-4 p-3 bg-amber-950/20 border border-amber-900/50 rounded-lg text-[10.5px] text-amber-300 text-center leading-relaxed">
-                  🏁 惜しい！対戦相手の精妙な制動停車が光りました。次回は大磯駅完美停止ボーナスで逆転を狙いましょう！
-                </div>
-              )}
-            </div>
+              );
+            })()}
 
             {/* Back action */}
             <div className="pt-4 border-t border-slate-800">
